@@ -1,3 +1,37 @@
+/**
+ * Welcome to Cloudflare Workers! This is your first worker.
+ *
+ * - Run `npm run dev` in your terminal to start a development server
+ * - Open a browser tab at http://localhost:8787/ to see your worker in action
+ * - Run `npm run deploy` to publish your worker
+ *
+ * Learn more at https://developers.cloudflare.com/workers/
+ */
+
+// #############################
+// ### START OF YOUR CONFIG  ###
+// #############################
+
+// --- 1. YOUR DOMAIN ---
+// Replace "20200108.xyz" with your actual domain name.
+const CUSTOM_DOMAIN = "20200108.xyz";
+
+// --- 2. DEBUG MODE (Optional) ---
+// Set to "debug" to enable debug headers and messages.
+// Leave as "" for production.
+const MODE = ""; 
+
+// --- 3. DEBUG UPSTREAM (Optional, for debug mode only) ---
+// If MODE is "debug", all requests will be forwarded to this upstream.
+const TARGET_UPSTREAM = "https://registry-1.docker.io";
+
+// #############################
+// ###  END OF YOUR CONFIG   ###
+// #############################
+
+
+// --- Core Worker Logic (No changes needed below) ---
+
 addEventListener("fetch", (event) => {
   event.passThroughOnException();
   event.respondWith(handleRequest(event.request));
@@ -6,7 +40,7 @@ addEventListener("fetch", (event) => {
 const dockerHub = "https://registry-1.docker.io";
 
 const routes = {
-  // production
+  // production routes are now generated automatically using your CUSTOM_DOMAIN
   ["docker." + CUSTOM_DOMAIN]: dockerHub,
   ["quay." + CUSTOM_DOMAIN]: "https://quay.io",
   ["gcr." + CUSTOM_DOMAIN]: "https://gcr.io",
@@ -16,7 +50,7 @@ const routes = {
   ["cloudsmith." + CUSTOM_DOMAIN]: "https://docker.cloudsmith.io",
   ["ecr." + CUSTOM_DOMAIN]: "https://public.ecr.aws",
 
-  // staging
+  // staging routes for testing
   ["docker-staging." + CUSTOM_DOMAIN]: dockerHub,
 };
 
@@ -32,17 +66,40 @@ function routeByHosts(host) {
 
 async function handleRequest(request) {
   const url = new URL(request.url);
+  // Handle root path request
   if (url.pathname == "/") {
-    return Response.redirect(url.protocol + "//" + url.host + "/v2/", 301);
+    //
+    const newUrl = new URL(request.url);
+    const host = newUrl.hostname;
+    //check if host is in routes
+    if(host in routes){
+        newUrl.pathname = "/v2/";
+        return Response.redirect(newUrl, 301);
+    }
+    // if not in routes, return the routes list
+    return new Response(
+        JSON.stringify({
+          message: "Welcome to Cloudflare Docker Proxy!",
+          routes: Object.keys(routes),
+          repository: "https://github.com/ciiiii/cloudflare-docker-proxy",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
   }
+
   const upstream = routeByHosts(url.hostname);
   if (upstream === "") {
     return new Response(
       JSON.stringify({
-        routes: routes,
+        message: "Route not found for this hostname. Please check your configuration.",
+        routes: Object.keys(routes),
       }),
       {
         status: 404,
+        headers: { "Content-Type": "application/json" }
       }
     );
   }
@@ -66,7 +123,7 @@ async function handleRequest(request) {
     return resp;
   }
   // get token
-  if (url.pathname == "/v2/auth") {
+  if (url.pathname.endsWith("/v2/auth") || url.pathname.endsWith("/token")) {
     const newUrl = new URL(upstream + "/v2/");
     const resp = await fetch(newUrl.toString(), {
       method: "GET",
@@ -92,19 +149,23 @@ async function handleRequest(request) {
     }
     return await fetchToken(wwwAuthenticate, scope, authorization);
   }
+  
+  const path = url.pathname;
+  const newUrl = new URL(upstream + path);
+
   // redirect for DockerHub library images
   // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
   if (isDockerHub) {
-    const pathParts = url.pathname.split("/");
-    if (pathParts.length == 5) {
-      pathParts.splice(2, 0, "library");
+    const pathParts = path.split("/");
+    if (pathParts.length == 5 && pathParts[1] === "v2" && !pathParts[2].includes("library")) {
+      const newPath = "/v2/library/" + path.substring(4);
       const redirectUrl = new URL(url);
-      redirectUrl.pathname = pathParts.join("/");
+      redirectUrl.pathname = newPath;
       return Response.redirect(redirectUrl, 301);
     }
   }
+
   // foward requests
-  const newUrl = new URL(upstream + url.pathname);
   const newReq = new Request(newUrl, {
     method: request.method,
     headers: request.headers,
@@ -116,13 +177,16 @@ async function handleRequest(request) {
     return responseUnauthorized(url);
   }
   // handle dockerhub blob redirect manually
-  if (isDockerHub && resp.status == 307) {
-    const location = new URL(resp.headers.get("Location"));
-    const redirectResp = await fetch(location.toString(), {
-      method: "GET",
-      redirect: "follow",
-    });
-    return redirectResp;
+  if (isDockerHub && resp.status >= 300 && resp.status < 400) {
+    const location = resp.headers.get("Location");
+    if (location) {
+        const redirectResp = await fetch(location, {
+            method: "GET",
+            headers: request.headers, // forward original headers
+            redirect: "follow",
+          });
+          return redirectResp;
+    }
   }
   return resp;
 }
@@ -133,6 +197,13 @@ function parseAuthenticate(authenticateStr) {
   const re = /(?<=\=")(?:\\.|[^"\\])*(?=")/g;
   const matches = authenticateStr.match(re);
   if (matches == null || matches.length < 2) {
+    // some registry response may not include service
+    if (matches != null && matches.length == 1) {
+        return {
+            realm: matches[0],
+            service: "",
+          };
+    }
     throw new Error(`invalid Www-Authenticate Header: ${authenticateStr}`);
   }
   return {
@@ -143,7 +214,7 @@ function parseAuthenticate(authenticateStr) {
 
 async function fetchToken(wwwAuthenticate, scope, authorization) {
   const url = new URL(wwwAuthenticate.realm);
-  if (wwwAuthenticate.service.length) {
+  if (wwwAuthenticate.service && wwwAuthenticate.service.length > 0) {
     url.searchParams.set("service", wwwAuthenticate.service);
   }
   if (scope) {
@@ -158,17 +229,11 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
 
 function responseUnauthorized(url) {
   const headers = new Headers();
-  if (MODE == "debug") {
-    headers.set(
+  const realm = (MODE === "debug" ? "http://" : "https://") + url.hostname + "/v2/auth";
+  headers.set(
       "Www-Authenticate",
-      `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
+      `Bearer realm="${realm}",service="cloudflare-docker-proxy"`
     );
-  } else {
-    headers.set(
-      "Www-Authenticate",
-      `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
-    );
-  }
   return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
     status: 401,
     headers: headers,
